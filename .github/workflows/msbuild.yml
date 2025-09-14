@@ -1,0 +1,31 @@
+name: MSBuild
+
+on:
+  push:
+    branches: [ "V2" ]
+  pull_request:
+    branches: [ "V2" ]
+
+env:
+  # Path to your .vcxproj file relative to repo root
+  PROJECT_FILE_PATH: FMODBootStrapper.vcxproj
+  BUILD_CONFIGURATION: Release
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v1.0.2
+
+    - name: Restore NuGet packages (if any)
+      run: nuget restore ${{ env.PROJECT_FILE_PATH }}
+
+    - name: Build Project
+      run: msbuild /m /p:Configuration=${{ env.BUILD_CONFIGURATION }} ${{ env.PROJECT_FILE_PATH }}
