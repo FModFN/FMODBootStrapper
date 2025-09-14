@@ -19,57 +19,62 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
 
-// ---------------- CONFIG ----------------
-static const bool ENABLE_LEGACY_INJECTION = true; // set false to avoid CreateRemoteThread injection (reduces AV FP)
+static const bool ENABLE_LEGACY_INJECTION = true;
 static const DWORD MONITOR_SLEEP_MS = 1000;
 static const wchar_t* APP_FOLDER_NAME = L"FModFN";
-// ----------------------------------------
 
+/// <summary>
+/// Main bootstrapper class responsible for launching the game, optionally injecting DLLs,
+/// monitoring loaded modules, and handling credentials.
+/// </summary>
 class Bootstrapper {
 public:
+    /// <summary>
+    /// Initializes default DLLs to inject and executable names.
+    /// </summary>
     Bootstrapper() {
-        // default DLLs to inject (look for them in the bootstrapper folder)
         gameDLLs = { L"Starfall.dll", L"Vivox_sdk64.dll" };
-
-        // game exe name (in same folder as bootstrapper)
         gameExeName = L"FortniteClient-Win64-Shipping.exe";
         launcherExeName = L"FortniteLauncher.exe";
         beExeName = L"FortniteClient-Win64-Shipping_BE.exe";
     }
 
+    /// <summary>
+    /// Runs the bootstrapper: launches helper processes, starts the game suspended,
+    /// optionally injects DLLs, resumes the game, and starts the monitoring thread.
+    /// </summary>
+    /// <returns>True if bootstrapper ran successfully, false otherwise.</returns>
     bool Run() {
-        // base (bootstrapper) directory (where this exe runs)
         std::filesystem::path exeFolder = std::filesystem::current_path();
 
-        // get %LOCALAPPDATA%\FModFN
         std::wstring localApp;
         if (!GetLocalAppData(localApp)) {
             std::wcerr << L"[error] Could not resolve LOCALAPPDATA\n";
             return false;
         }
+
         std::filesystem::path appdir = std::filesystem::path(localApp) / APP_FOLDER_NAME;
 
-        // read creds
+        /// <summary>
+        /// Reads user credentials from the app folder.
+        /// </summary>
         std::string email = ReadTextFileUtf8(appdir / L"email.txt");
         std::string password = ReadTextFileUtf8(appdir / L"password.txt");
         if (email.empty() || password.empty()) {
-            std::wcerr << L"[error] Missing email.txt or password.txt in " << appdir.wstring() << L"\n";
+            std::wcerr << L"[error] Missing email.txt or password.txt\n";
             MessageBoxW(NULL, (L"Missing email.txt or password.txt in " + appdir.wstring()).c_str(), L"Bootstrapper", MB_OK | MB_ICONERROR);
             return false;
         }
 
-        // launch helper processes from appdir if present
-        std::filesystem::path launcherPath = appdir / launcherExeName;
-        if (std::filesystem::exists(launcherPath)) {
-            LaunchSimpleProcess(launcherPath.wstring(), L"");
-        }
+        /// <summary>
+        /// Launch optional helper processes if present.
+        /// </summary>
+        LaunchSimpleProcess(appdir / launcherExeName, L"");
+        LaunchSimpleProcess(appdir / beExeName, L"");
 
-        std::filesystem::path bePath = appdir / beExeName;
-        if (std::filesystem::exists(bePath)) {
-            LaunchSimpleProcess(bePath.wstring(), L"");
-        }
-
-        // Build UE args string (same as your C#)
+        /// <summary>
+        /// Construct command-line arguments for the game executable.
+        /// </summary>
         std::wstring args =
             L"-log -epicapp=Fortnite -epicenv=Prod -epiclocale=en-us "
             L"-epicportal -skippatchcheck -nobe -fromfl=eac "
@@ -79,14 +84,15 @@ public:
             L" -AUTH_PASSWORD=" + std::wstring(password.begin(), password.end()) +
             L" -AUTH_TYPE=epic";
 
-        // Game exe path (from same folder as bootstrapper)
+        /// <summary>
+        /// Launch the game process suspended for injection or checks.
+        /// </summary>
         std::filesystem::path gamePath = exeFolder / gameExeName;
         if (!std::filesystem::exists(gamePath)) {
-            std::wcerr << L"[error] Game exe not found in current folder: " << gamePath.wstring() << L"\n";
+            std::wcerr << L"[error] Game exe not found: " << gamePath.wstring() << L"\n";
             return false;
         }
 
-        // Launch game suspended so we can inject/check before resume
         PROCESS_INFORMATION pi{};
         if (!CreateProcessSuspended(gamePath.wstring(), args, pi)) {
             std::wcerr << L"[error] Failed to create game process\n";
@@ -97,39 +103,28 @@ public:
         targetPid = pi.dwProcessId;
         std::wcout << L"[info] Game process created (PID: " << targetPid << L")\n";
 
-        // Attempt legacy injection if enabled (inject DLLs from exe folder)
+        /// <summary>
+        /// Inject configured DLLs if legacy injection is enabled.
+        /// </summary>
         if (ENABLE_LEGACY_INJECTION) {
             for (auto& dll : gameDLLs) {
                 std::filesystem::path dllP = exeFolder / dll;
-                if (!std::filesystem::exists(dllP)) {
-                    std::wcout << L"[warn] DLL not found: " << dllP.wstring() << L"\n";
-                    continue;
-                }
-                if (!LegacyInjectDLL(targetPid, dllP.wstring())) {
-                    std::wcerr << L"[error] Failed to inject " << dllP.wstring() << L"\n";
-                    // optional: decide to terminate
-                }
-                else {
-                    std::wcout << L"[info] Injected: " << dllP.wstring() << L"\n";
-                }
+                if (!std::filesystem::exists(dllP)) continue;
+                LegacyInjectDLL(targetPid, dllP.wstring());
             }
         }
-        else {
-            std::wcout << L"[info] Legacy injection disabled (recommended). Make sure the game loads your DLLs itself.\n";
-        }
 
-        // Resume game main thread
+        /// <summary>
+        /// Resume the main game thread and start monitoring loaded modules.
+        /// </summary>
         ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
-
-        // Start monitoring thread
         monitoringThread = CreateThread(nullptr, 0, MonitorThreadProc, this, 0, nullptr);
 
         std::wcout << L"[info] Bootstrapper running. Press Enter to exit (game continues).\n";
         std::wstring dummy;
         std::getline(std::wcin, dummy);
 
-        // Clean up
         if (monitoringThread) {
             TerminateThread(monitoringThread, 0);
             CloseHandle(monitoringThread);
@@ -139,22 +134,19 @@ public:
     }
 
 private:
-    // members
     std::vector<std::wstring> gameDLLs;
     std::wstring gameExeName;
     std::wstring launcherExeName;
     std::wstring beExeName;
-
-    // target process
     HANDLE hProcess = nullptr;
     DWORD targetPid = 0;
-
-    // monitoring
     HANDLE monitoringThread = nullptr;
     std::unordered_set<std::wstring> checkedModules;
     std::mutex checkedModulesMutex;
 
-    // ---------------- helpers ----------------
+    /// <summary>
+    /// Get the LOCALAPPDATA path.
+    /// </summary>
     static bool GetLocalAppData(std::wstring& out) {
         PWSTR path = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &path))) {
@@ -165,159 +157,106 @@ private:
         return false;
     }
 
+    /// <summary>
+    /// Reads a UTF-8 text file into a string.
+    /// </summary>
     static std::string ReadTextFileUtf8(const std::filesystem::path& p) {
-        std::ifstream f(p, std::ios::in);
-        if (!f) return std::string();
-        std::ostringstream ss;
-        ss << f.rdbuf();
+        std::ifstream f(p); if (!f) return {};
+        std::ostringstream ss; ss << f.rdbuf();
         std::string s = ss.str();
-        // trim whitespace/newlines
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
-        size_t start = 0;
-        while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) start++;
-        if (start) s = s.substr(start);
-        return s;
+        size_t start = 0; while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) start++;
+        return s.substr(start);
     }
 
+    /// <summary>
+    /// Launch a simple process without waiting.
+    /// </summary>
     static bool LaunchSimpleProcess(const std::wstring& exePath, const std::wstring& args) {
-        STARTUPINFOW si{}; PROCESS_INFORMATION pi{};
-        si.cb = sizeof(si);
-        std::wstring cmd = L"\"" + exePath + L"\"";
-        if (!args.empty()) { cmd += L" " + args; }
+        STARTUPINFOW si{}; PROCESS_INFORMATION pi{}; si.cb = sizeof(si);
+        std::wstring cmd = L"\"" + exePath + L"\""; if (!args.empty()) cmd += L" " + args;
         std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(0);
         BOOL ok = CreateProcessW(NULL, buf.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-        if (ok) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            return true;
-        }
+        if (ok) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return true; }
         return false;
     }
 
+    /// <summary>
+    /// Launch a process suspended (for injection/checking).
+    /// </summary>
     static bool CreateProcessSuspended(const std::wstring& exePath, const std::wstring& args, PROCESS_INFORMATION& outPi) {
         STARTUPINFOW si{}; si.cb = sizeof(si);
-        std::wstring cmd = L"\"" + exePath + L"\"";
-        if (!args.empty()) cmd += L" " + args;
+        std::wstring cmd = L"\"" + exePath + L"\""; if (!args.empty()) cmd += L" " + args;
         std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(0);
-        BOOL ok = CreateProcessW(NULL, buf.data(), NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &outPi);
-        return ok == TRUE;
+        return CreateProcessW(NULL, buf.data(), NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &outPi) == TRUE;
     }
 
-    // legacy injection (CreateRemoteThread + LoadLibraryW)
+    /// <summary>
+    /// Inject a DLL into the target process using LoadLibraryW.
+    /// </summary>
     static bool LegacyInjectDLL(DWORD pid, const std::wstring& dllPath) {
         HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
         if (!proc) return false;
-
         size_t bytes = (dllPath.size() + 1) * sizeof(wchar_t);
         LPVOID remote = VirtualAllocEx(proc, NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!remote) { CloseHandle(proc); return false; }
-
-        if (!WriteProcessMemory(proc, remote, dllPath.c_str(), bytes, NULL)) {
-            VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-            CloseHandle(proc);
-            return false;
-        }
-
+        if (!WriteProcessMemory(proc, remote, dllPath.c_str(), bytes, NULL)) { VirtualFreeEx(proc, remote, 0, MEM_RELEASE); CloseHandle(proc); return false; }
         HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
         FARPROC loadAddr = GetProcAddress(k32, "LoadLibraryW");
-        if (!loadAddr) {
-            VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-            CloseHandle(proc);
-            return false;
-        }
-
+        if (!loadAddr) { VirtualFreeEx(proc, remote, 0, MEM_RELEASE); CloseHandle(proc); return false; }
         HANDLE th = CreateRemoteThread(proc, NULL, 0, (LPTHREAD_START_ROUTINE)loadAddr, remote, 0, NULL);
-        if (!th) {
-            VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-            CloseHandle(proc);
-            return false;
-        }
-
-        WaitForSingleObject(th, INFINITE);
-        CloseHandle(th);
-        VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-        CloseHandle(proc);
+        if (!th) { VirtualFreeEx(proc, remote, 0, MEM_RELEASE); CloseHandle(proc); return false; }
+        WaitForSingleObject(th, INFINITE); CloseHandle(th);
+        VirtualFreeEx(proc, remote, 0, MEM_RELEASE); CloseHandle(proc);
         return true;
     }
 
-    // simple system DLL check (whitelist)
-    static bool IsSystemDLL(const std::wstring& path) {
-        std::wstring lower = path;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
-
-        wchar_t sysDir[MAX_PATH]; GetSystemDirectoryW(sysDir, MAX_PATH);
-        std::wstring sys = sysDir; std::transform(sys.begin(), sys.end(), sys.begin(), ::towlower);
-
-        if (lower.rfind(sys, 0) == 0) return true;
-        if (lower.find(L"\\windows\\winsxs\\") != std::wstring::npos) return true;
-        if (lower.find(L"\\windows\\system32\\drivers\\") != std::wstring::npos) return true;
-        return false;
-    }
-
-    // basic game DLL check: allow known filenames present in gameDLLs
-    bool IsGameDLL(const std::wstring& path) {
-        for (auto& g : gameDLLs) {
-            if (path.find(g) != std::wstring::npos) return true;
-        }
-        return false;
-    }
-
-    // minimal unsigned check placeholder: you can plug WinVerifyTrust or hash checks here
-    static bool IsFileSignedOrKnownGood(const std::wstring& path) {
-        // for now - allow system DLLs and don't block; this function can be expanded
-        return true;
-    }
-
-    // monitor thread: enumerates modules once per interval and logs suspicious ones (simple)
+    /// <summary>
+    /// Monitors loaded modules in the target process and logs suspicious ones.
+    /// </summary>
     void MonitorProc() {
         std::vector<HMODULE> mods(1024);
         DWORD needed = 0;
-
         while (hProcess) {
-            if (!EnumProcessModules(hProcess, mods.data(), static_cast<DWORD>(mods.size() * sizeof(HMODULE)), &needed)) {
-                Sleep(MONITOR_SLEEP_MS);
-                continue;
-            }
+            if (!EnumProcessModules(hProcess, mods.data(), static_cast<DWORD>(mods.size() * sizeof(HMODULE)), &needed)) { Sleep(MONITOR_SLEEP_MS); continue; }
             DWORD count = needed / sizeof(HMODULE);
             if (count > mods.size()) { mods.resize(count + 16); Sleep(MONITOR_SLEEP_MS); continue; }
 
             for (DWORD i = 0; i < count; ++i) {
-                wchar_t name[MAX_PATH];
-                if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
+                wchar_t name[MAX_PATH]; if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
                 std::wstring path(name);
-
-                {
-                    std::scoped_lock lk(checkedModulesMutex);
-                    if (checkedModules.find(path) != checkedModules.end()) continue;
-                    checkedModules.insert(path);
-                }
-
+                std::scoped_lock lk(checkedModulesMutex);
+                if (checkedModules.find(path) != checkedModules.end()) continue;
+                checkedModules.insert(path);
                 if (IsSystemDLL(path) || IsGameDLL(path)) continue;
-
-                if (!IsFileSignedOrKnownGood(path)) {
-                    std::wcout << L"[AC] Unsigned/unexpected module: " << path << L"\n";
-                    // optional: take action (terminate) based on policy
-                }
+                if (!IsFileSignedOrKnownGood(path)) std::wcout << L"[AC] Unsigned/unexpected module: " << path << L"\n";
             }
-
-            // Optional: scan threads for suspicious start addresses (left out for simplicity)
-
             Sleep(MONITOR_SLEEP_MS);
         }
     }
 
     static DWORD WINAPI MonitorThreadProc(LPVOID param) {
-        Bootstrapper* bs = reinterpret_cast<Bootstrapper*>(param);
-        bs->MonitorProc();
+        reinterpret_cast<Bootstrapper*>(param)->MonitorProc();
         return 0;
     }
+
+    bool IsGameDLL(const std::wstring& path) {
+        for (auto& g : gameDLLs) if (path.find(g) != std::wstring::npos) return true;
+        return false;
+    }
+
+    static bool IsSystemDLL(const std::wstring& path) {
+        std::wstring lower = path; std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+        wchar_t sysDir[MAX_PATH]; GetSystemDirectoryW(sysDir, MAX_PATH);
+        std::wstring sys = sysDir; std::transform(sys.begin(), sys.end(), sys.begin(), ::towlower);
+        return lower.rfind(sys, 0) == 0 || lower.find(L"\\windows\\winsxs\\") != std::wstring::npos || lower.find(L"\\windows\\system32\\drivers\\") != std::wstring::npos;
+    }
+
+    static bool IsFileSignedOrKnownGood(const std::wstring&) { return true; }
 };
 
-int wmain(int argc, wchar_t* argv[]) {
+int wmain(int, wchar_t* []) {
     Bootstrapper b;
-    if (!b.Run()) {
-        std::wcerr << L"[fatal] bootstrapper failed\n";
-        return 1;
-    }
+    if (!b.Run()) { std::wcerr << L"[fatal] bootstrapper failed\n"; return 1; }
     return 0;
 }
