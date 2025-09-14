@@ -7,7 +7,7 @@ Permission is granted **only to view and inspect this source code for the sole p
 ### 1. Restricted Use
 
 * You **may not copy, modify, distribute, or otherwise use** this source code for any purpose.
-* You **may not compile, build, or deploy** this code in any environment.
+* You **may not compile, build, or deploy** this code in any environment EXCEPT if you are building to use on FMOD for your own safetey as you dont trust the precompiled bin.
 * You **may not extract, reuse, or reference** any part of the source in other projects, tools, or software.
 
 ### 2. Permitted Use
