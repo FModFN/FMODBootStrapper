@@ -55,9 +55,6 @@ public:
 
         std::filesystem::path appdir = std::filesystem::path(localApp) / APP_FOLDER_NAME;
 
-        /// <summary>
-        /// Reads user credentials from the app folder.
-        /// </summary>
         std::string email = ReadTextFileUtf8(appdir / L"email.txt");
         std::string password = ReadTextFileUtf8(appdir / L"password.txt");
         if (email.empty() || password.empty()) {
@@ -66,46 +63,85 @@ public:
             return false;
         }
 
-        /// <summary>
-        /// Launch optional helper processes if present.
-        /// </summary>
         LaunchSimpleProcess(appdir / launcherExeName, L"");
         LaunchSimpleProcess(appdir / beExeName, L"");
-
-        /// <summary>
-        /// Construct command-line arguments for the game executable.
-        /// </summary>
-        std::wstring args =
+        std::wstring args(
             L"-log -epicapp=Fortnite -epicenv=Prod -epiclocale=en-us "
             L"-epicportal -skippatchcheck -nobe -fromfl=eac "
             L"-fltoken=3db3ba5dcbd2e16703f3978d -nosplash "
-            L"-caldera=eyJhbGciOi... (truncated) ..."
-            L" -AUTH_LOGIN=" + std::wstring(email.begin(), email.end()) +
-            L" -AUTH_PASSWORD=" + std::wstring(password.begin(), password.end()) +
-            L" -AUTH_TYPE=epic";
+            L"-caldera=eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9..."
+            L" -AUTH_LOGIN=host@fmod.dev"
+            L" -AUTH_PASSWORD=host"
+            L" -AUTH_TYPE=epic"
+            L" -nullrhi -nosound -unattended"
+        );
 
-        /// <summary>
-        /// Launch the game process suspended for injection or checks.
-        /// </summary>
+
         std::filesystem::path gamePath = exeFolder / gameExeName;
         if (!std::filesystem::exists(gamePath)) {
             std::wcerr << L"[error] Game exe not found: " << gamePath.wstring() << L"\n";
             return false;
         }
 
-        PROCESS_INFORMATION pi{};
-        if (!CreateProcessSuspended(gamePath.wstring(), args, pi)) {
-            std::wcerr << L"[error] Failed to create game process\n";
+        // Create pipe for stdout redirection
+        SECURITY_ATTRIBUTES saAttr{};
+        saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+        saAttr.bInheritHandle = TRUE;
+        saAttr.lpSecurityDescriptor = NULL;
+
+        HANDLE hChildStdoutRd = NULL;
+        HANDLE hChildStdoutWr = NULL;
+
+        if (!CreatePipe(&hChildStdoutRd, &hChildStdoutWr, &saAttr, 0)) {
+            std::wcerr << L"[-] CreatePipe failed\n";
             return false;
         }
+
+        if (!SetHandleInformation(hChildStdoutRd, HANDLE_FLAG_INHERIT, 0)) {
+            std::wcerr << L"[-] SetHandleInformation failed\n";
+            CloseHandle(hChildStdoutRd);
+            CloseHandle(hChildStdoutWr);
+            return false;
+        }
+
+        // Prepare STARTUPINFO with redirected stdout
+        STARTUPINFOW si{};
+        si.cb = sizeof(STARTUPINFOW);
+        si.hStdOutput = hChildStdoutWr;
+        si.hStdError = hChildStdoutWr; // redirect stderr as well if desired
+        si.dwFlags |= STARTF_USESTDHANDLES;
+
+        PROCESS_INFORMATION pi{};
+
+        // Compose command line
+        std::wstring cmdLine = L"\"" + gamePath.wstring() + L"\" " + args;
+
+        // Create process suspended with redirected stdout
+        if (!CreateProcessW(
+            NULL,
+            cmdLine.data(),
+            NULL,
+            NULL,
+            TRUE, // inherit handles for pipe
+            CREATE_SUSPENDED | CREATE_NEW_CONSOLE,
+            NULL,
+            gamePath.parent_path().c_str(),
+            &si,
+            &pi)) {
+            std::wcerr << L"[-] CreateProcess failed\n";
+            CloseHandle(hChildStdoutRd);
+            CloseHandle(hChildStdoutWr);
+            return false;
+        }
+
+        // Close the write end in the parent process, so we can read EOF when child closes
+        CloseHandle(hChildStdoutWr);
 
         hProcess = pi.hProcess;
         targetPid = pi.dwProcessId;
         std::wcout << L"[info] Game process created (PID: " << targetPid << L")\n";
 
-        /// <summary>
-        /// Inject configured DLLs if legacy injection is enabled.
-        /// </summary>
+        // Inject your initial DLLs as usual (legacy injection)
         if (ENABLE_LEGACY_INJECTION) {
             for (auto& dll : gameDLLs) {
                 std::filesystem::path dllP = exeFolder / dll;
@@ -114,21 +150,46 @@ public:
             }
         }
 
-        /// <summary>
-        /// Resume the main game thread and start monitoring loaded modules.
-        /// </summary>
+        // Resume the main thread
         ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
-        monitoringThread = CreateThread(nullptr, 0, MonitorThreadProc, this, 0, nullptr);
 
-        std::wcout << L"[info] Bootstrapper running. Press Enter to exit (game continues).\n";
+        // Start thread to monitor stdout pipe for "CheckingForPatch"
+        std::thread monitorThread([this, hChildStdoutRd, pi, exeFolder]() {
+            constexpr DWORD bufferSize = 4096;
+            char buffer[bufferSize];
+            DWORD bytesRead;
+            std::string output;
+
+            while (true) {
+                BOOL success = ReadFile(hChildStdoutRd, buffer, bufferSize - 1, &bytesRead, NULL);
+                if (!success || bytesRead == 0) break;
+                buffer[bytesRead] = 0;
+                output += buffer;
+
+                if (output.find("CheckingForPatch") != std::string::npos) {
+                    std::wcout << L"[+] Detected CheckingForPatch in output, injecting 8.51.dll...\n";
+                    std::filesystem::path dllPath = exeFolder / L"8.51.dll";
+                    if (!LegacyInjectDLL(pi.dwProcessId, dllPath.wstring())) {
+                        std::wcerr << L"[-] DLL injection failed again. Continuing without killing process.\n";
+                    }
+                    else {
+                        std::wcout << L"[+] Large paks patched successfully!\n";
+                    }
+                    break;
+                }
+            }
+            CloseHandle(hChildStdoutRd);
+            });
+
+        monitorThread.detach();
+
+        std::wcout << L"[<] Waiting for game initialization...\n";
+
+        // Your existing wait or exit logic here
         std::wstring dummy;
         std::getline(std::wcin, dummy);
 
-        if (monitoringThread) {
-            TerminateThread(monitoringThread, 0);
-            CloseHandle(monitoringThread);
-        }
         CloseHandle(hProcess);
         return true;
     }
