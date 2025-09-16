@@ -33,7 +33,7 @@ public:
     /// Initializes default DLLs to inject and executable names.
     /// </summary>
     Bootstrapper() {
-        gameDLLs = { L"Starfall.dll", L"Vivox_sdk64.dll" };
+        gameDLLs = { L"Starfall.dll", L"Vivox_sdk64.dll", L"Horizion.ClientPatches.dll"};
         gameExeName = L"FortniteClient-Win64-Shipping.exe";
         launcherExeName = L"FortniteLauncher.exe";
         beExeName = L"FortniteClient-Win64-Shipping_BE.exe";
@@ -73,7 +73,7 @@ public:
             L" -AUTH_LOGIN=host@fmod.dev"
             L" -AUTH_PASSWORD=host"
             L" -AUTH_TYPE=epic"
-            L" -nullrhi -nosound -unattended"
+            L" -nullrhi -nosound -unattended -log"
         );
 
 
@@ -83,59 +83,32 @@ public:
             return false;
         }
 
-        // Create pipe for stdout redirection
-        SECURITY_ATTRIBUTES saAttr{};
-        saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
-        saAttr.bInheritHandle = TRUE;
-        saAttr.lpSecurityDescriptor = NULL;
-
-        HANDLE hChildStdoutRd = NULL;
-        HANDLE hChildStdoutWr = NULL;
-
-        if (!CreatePipe(&hChildStdoutRd, &hChildStdoutWr, &saAttr, 0)) {
-            std::wcerr << L"[-] CreatePipe failed\n";
-            return false;
-        }
-
-        if (!SetHandleInformation(hChildStdoutRd, HANDLE_FLAG_INHERIT, 0)) {
-            std::wcerr << L"[-] SetHandleInformation failed\n";
-            CloseHandle(hChildStdoutRd);
-            CloseHandle(hChildStdoutWr);
-            return false;
-        }
-
-        // Prepare STARTUPINFO with redirected stdout
+        // Prepare STARTUPINFO (no redirected stdout/stderr anymore)
         STARTUPINFOW si{};
         si.cb = sizeof(STARTUPINFOW);
-        si.hStdOutput = hChildStdoutWr;
-        si.hStdError = hChildStdoutWr; // redirect stderr as well if desired
-        si.dwFlags |= STARTF_USESTDHANDLES;
 
         PROCESS_INFORMATION pi{};
 
         // Compose command line
         std::wstring cmdLine = L"\"" + gamePath.wstring() + L"\" " + args;
 
-        // Create process suspended with redirected stdout
+        // Create process suspended (no inherited handles, no stdout redirection)
+        std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+        cmdBuf.push_back(0);
         if (!CreateProcessW(
             NULL,
-            cmdLine.data(),
+            cmdBuf.data(),
             NULL,
             NULL,
-            TRUE, // inherit handles for pipe
+            FALSE, // do not inherit handles
             CREATE_SUSPENDED | CREATE_NEW_CONSOLE,
             NULL,
             gamePath.parent_path().c_str(),
             &si,
             &pi)) {
             std::wcerr << L"[-] CreateProcess failed\n";
-            CloseHandle(hChildStdoutRd);
-            CloseHandle(hChildStdoutWr);
             return false;
         }
-
-        // Close the write end in the parent process, so we can read EOF when child closes
-        CloseHandle(hChildStdoutWr);
 
         hProcess = pi.hProcess;
         targetPid = pi.dwProcessId;
@@ -154,35 +127,9 @@ public:
         ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
 
-        // Start thread to monitor stdout pipe for "CheckingForPatch"
-        std::thread monitorThread([this, hChildStdoutRd, pi, exeFolder]() {
-            constexpr DWORD bufferSize = 4096;
-            char buffer[bufferSize];
-            DWORD bytesRead;
-            std::string output;
-
-            while (true) {
-                BOOL success = ReadFile(hChildStdoutRd, buffer, bufferSize - 1, &bytesRead, NULL);
-                if (!success || bytesRead == 0) break;
-                buffer[bytesRead] = 0;
-                output += buffer;
-
-                if (output.find("CheckingForPatch") != std::string::npos) {
-                    std::wcout << L"[+] Detected CheckingForPatch in output, injecting 8.51.dll...\n";
-                    std::filesystem::path dllPath = exeFolder / L"8.51.dll";
-                    if (!LegacyInjectDLL(pi.dwProcessId, dllPath.wstring())) {
-                        std::wcerr << L"[-] DLL injection failed again. Continuing without killing process.\n";
-                    }
-                    else {
-                        std::wcout << L"[+] Large paks patched successfully!\n";
-                    }
-                    break;
-                }
-            }
-            CloseHandle(hChildStdoutRd);
-            });
-
-        monitorThread.detach();
+        // Start monitoring thread for loaded modules (keeps original monitoring logic)
+        HANDLE mon = CreateThread(NULL, 0, MonitorThreadProc, this, 0, NULL);
+        if (mon) CloseHandle(mon);
 
         std::wcout << L"[<] Waiting for game initialization...\n";
 
