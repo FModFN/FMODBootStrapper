@@ -1,9 +1,2 @@
 ﻿  FMODBootStrapper.cpp
-  Generating code
-  314 of 827 functions (38.0%) were compiled, the rest were copied from previous compilation.
-    165 functions were new in current compilation
-    103 functions had inline decision re-evaluated but remain unchanged
-  Finished generating code
-  FMODBootStrapper.vcxproj -> C:\Users\jj705\source\repos\FMODBootStrapper\x64\Release\FMODBootStrapper.exe
-  'pwsh.exe' is not recognized as an internal or external command,
-  operable program or batch file.
+C:\Users\jj705\source\repos\FMODBootStrapper\FMODBootStrapper\FMODBootStrapper.cpp(318,24): error C1075: '{': no matching token found
